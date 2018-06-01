@@ -15,10 +15,6 @@ class ServiceModuleTest
 
     "on receiving an ActorConfiguration message" - {
 
-      val childMaker = mockFunction[ActorRefFactory, Class[_ <: Actor], String, ActorRef]
-      val configuration = ServiceModule.ActorConfiguration(childMaker, stub[DCOSProxy.HttpClientFactory], "service-1")
-
-
 
     }
 

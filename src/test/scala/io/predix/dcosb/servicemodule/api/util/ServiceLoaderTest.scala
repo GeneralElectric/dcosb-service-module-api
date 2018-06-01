@@ -24,7 +24,7 @@ class ServiceLoaderTest extends ActorSuite {
       a match {
         case actorClass: Class[_] if actorClass == classOf[DCOSProxy] => TestActorRef(Props(new Actor {
           override def receive: Receive = {
-            case DCOSProxy.Configuration(_, _, _, _) => sender() ! Success(ConfiguredActor.Configured())
+            case DCOSProxy.Configuration(_, _, _, _, _, _) => sender() ! Success(ConfiguredActor.Configured())
           }
         }).withDispatcher(CallingThreadDispatcher.Id))
         case actorClass => TestActorRef(Props(actorClass).withDispatcher(CallingThreadDispatcher.Id), name)
@@ -33,7 +33,12 @@ class ServiceLoaderTest extends ActorSuite {
     }
 
     val serviceLoader = TestActorRef(Props(new ServiceLoader()).withDispatcher(CallingThreadDispatcher.Id))
-    serviceLoader ! ServiceLoader.Configuration(childMaker, stub[DCOSProxy.HttpClientFactory])
+    val aksm = TestActorRef(Props(new Actor {
+      override def receive = {
+        case _ =>
+      }
+    }).withDispatcher(CallingThreadDispatcher.Id))
+    serviceLoader ! ServiceLoader.Configuration(childMaker, stub[DCOSProxy.HttpClientFactory], aksm)
 
     "with a ServiceModule implementation available on the classpath" - {
 

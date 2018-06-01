@@ -33,7 +33,7 @@ object ServiceLoader {
       ActorRef))]
 
   case class Configuration(
-      childMaker: (ActorRefFactory, Class[_ <: Actor], String) => ActorRef, httpClientFactory: DCOSProxy.HttpClientFactory)
+      childMaker: (ActorRefFactory, Class[_ <: Actor], String) => ActorRef, httpClientFactory: DCOSProxy.HttpClientFactory, aksm: ActorRef)
 
   // handled messages
   case class RegisterService(id: String, clazz: String)
@@ -58,6 +58,7 @@ class ServiceLoader
   private var childMaker
     : Option[(ActorRefFactory, Class[_ <: Actor], String) => ActorRef] = None
   private var httpClientFactory: Option[DCOSProxy.HttpClientFactory] = None
+  private var aksm: Option[ActorRef] = None
 
   private val serviceGetConfigTimeout = tConfig
     .getValue("dcosb.service-loader.get-config-timeout")
@@ -70,6 +71,7 @@ class ServiceLoader
       configuration: Configuration): Future[ConfiguredActor.Configured] = {
     childMaker = Some(configuration.childMaker)
     httpClientFactory = Some(configuration.httpClientFactory)
+    aksm = Some(configuration.aksm)
     super.configure(configuration)
   }
 
@@ -117,16 +119,16 @@ class ServiceLoader
     implicit val askTimeout: Timeout = Timeout(serviceActorConfigTimeout)
 
     val promise = Promise[ActorRef]()
-    (childMaker, httpClientFactory) match {
+    (childMaker, httpClientFactory, aksm) match {
 
-      case (Some(c), Some(h)) =>
+      case (Some(c), Some(h), Some(k)) =>
         try {
           val serviceClass =
             Class.forName(implementingClassName).asInstanceOf[Class[_ <: Actor]]
 
           val service = c(context, serviceClass, id)
           // configure service..
-          (service ? ServiceModule.ActorConfiguration(c, h, id)) onComplete {
+          (service ? ServiceModule.ActorConfiguration(c, h, k, id)) onComplete {
             case Success(Success(ConfiguredActor.Configured())) =>
               promise.success(service)
             case Success(Failure(e:Throwable)) => promise.failure(e)

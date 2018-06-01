@@ -3,24 +3,18 @@ package io.predix.dcosb.servicemodule.api
 import java.net.InetSocketAddress
 import java.util.concurrent.TimeUnit
 
-import akka.actor.{
-  Actor,
-  ActorLogging,
-  ActorRef,
-  ActorRefFactory,
-  Cancellable,
-  Stash,
-  Terminated
-}
+import akka.actor.{Actor, ActorLogging, ActorRef, ActorRefFactory, Cancellable, Stash, Terminated}
 import akka.pattern.ask
 import akka.util.Timeout
 import com.typesafe.config.ConfigFactory
 import io.predix.dcosb.dcos.cosmos.CosmosApiClient
 import io.predix.dcosb.dcos.marathon.MarathonApiClient
 import io.predix.dcosb.dcos.service.PlanApiClient
+import io.predix.dcosb.dcos.service.PlanApiClient.ApiModel
 import pureconfig.syntax._
 import io.predix.dcosb.dcos.{DCOSCommon, DCOSProxy}
 import io.predix.dcosb.mesos.MesosApiClient
+import io.predix.dcosb.mesos.MesosApiClient.Master.FrameworkNotFound
 import io.predix.dcosb.mesos.MesosApiClient.MesosApiModel.Master.Frameworks.Framework
 import io.predix.dcosb.servicemodule.api.ServiceModule.OSB.PreviousValues
 import io.predix.dcosb.util.actor.ActorUtils
@@ -69,8 +63,13 @@ object ServiceModule {
 
   }
 
-  class ServiceInstanceCreationException(message: String)
-      extends Exception(message)
+  trait OperationDenied extends Throwable
+
+  /* Special Throwables
+  ----------------------- */
+  case class InsufficientApplicationPermissions(message: String) extends OperationDenied
+  case class MalformedRequest(message: String) extends OperationDenied
+  case class ServiceInstanceNotFound(serviceInstanceId: String) extends OperationDenied
 
   /* Internals
   -------------------- */
@@ -80,12 +79,14 @@ object ServiceModule {
     *
     * @param childMaker        function used to create actor(reference)s from actor classes
     * @param httpClientFactory function used to create a [[DCOSProxy.HttpClient]] from [[DCOSCommon.Connection]] information
+    * @param aksm              Actor reference to the system AkkaKeyStoreManager
     * @param serviceId         the configuration string used in creating this service module instance. Use with [[ServiceModule.getConfiguration()]] to
     *                          retrieve [[ServiceModuleConfiguration]] from this instance
     */
   case class ActorConfiguration(
       childMaker: (ActorRefFactory, Class[_ <: Actor], String) => ActorRef,
       httpClientFactory: DCOSProxy.HttpClientFactory,
+      aksm: ActorRef,
       serviceId: String)
 
   /* SM API related messages ( requests )
@@ -147,6 +148,36 @@ object ServiceModule {
     val IN_PROGRESS = Value("in progress")
     val SUCCEEDED = Value("succeeded")
     val FAILED = Value("failed")
+  }
+
+  object PlanProcessors {
+
+    // helpers to traverse Plan objects
+
+    def stepMessages(phases: Iterable[PlanApiClient.ApiModel.Phase],
+                             phaseName: String = "node-deploy") = {
+      phases.filter(_.name == phaseName) flatMap { phase =>
+        for (step <- phase.steps)
+          yield s"${step.name} -> ${step.status}"
+
+      }
+    }
+
+    def countIncompleteSteps(
+                                      phases: Iterable[PlanApiClient.ApiModel.Phase],
+                                      phaseName: String): Int = {
+      (phases.filter(_.name == phaseName) flatMap { phase =>
+        for (step <- phase.steps; if step.status != "COMPLETE")
+          yield step
+
+      }).size
+    }
+
+    def countSteps(phases: Iterable[PlanApiClient.ApiModel.Phase],
+                           phaseName: String): Int = {
+      ((phases.filter(_.name == phaseName)) flatMap { _.steps }).size
+    }
+
   }
 
 }
@@ -249,7 +280,7 @@ abstract class ServiceModule[
   /* Helpers for SM implementations
   ----------------------------------- */
 
-  private val tConfig = ConfigFactory.load()
+  protected val tConfig = ConfigFactory.load()
   implicit val dcosProxyTimeout = Timeout(
     tConfig.getValue("dcosb.dcos.proxy-timeout").toOrThrow[FiniteDuration])
 
@@ -312,6 +343,17 @@ abstract class ServiceModule[
     }
   }
 
+  def withAkkaKeyStoreManagerOrFailPromise[T](f: (ActorRef => _), promise: Promise[T]) = {
+    aksm match {
+      case Some(p: ActorRef) => f(p)
+      case None =>
+        promise.failure(
+          DCOSProxy.ClusterUnavailable(
+            "The system AkkaKeyStoreManager was available to serve this request",
+            None,
+            None))
+    }
+  }
   /**
     * Fails the promise if there is no plan named planName for service instance serviceInstanceId
     * @param serviceInstanceId
@@ -368,6 +410,112 @@ abstract class ServiceModule[
     }
   }
 
+  /**
+    * Encapsulates basic processing of a deploy [[ApiModel.Plan]] object to glean
+    * status of a create/update/destroy operation
+    * @param operation
+    * @param scheduler
+    * @param deployPlan
+    * @return
+    */
+  def operationStatusFrom(
+    serviceInstanceId: String,
+    operation: OSB.Operation.Value,
+    scheduler: Option[DCOSCommon.Scheduler],
+    deployPlan: Try[ApiModel.Plan],
+    inProgressStates: List[String] = List("WAITING", "PENDING", "STARTING", "IN_PROGRESS"),
+    msgDestroyPending:(Seq[ApiModel.Phase] => String),
+    msgCreateUpdatePending:(Seq[ApiModel.Phase] => String),
+    msgCreateUpdateComplete:(Seq[ApiModel.Phase] => String)): Option[LastOperationStatus] = {
+    import PlanProcessors._
+
+    (operation, scheduler, deployPlan) match {
+
+      /* CREATE
+      ----------- */
+      case (operation, None, _)
+        if operation == OSB.Operation.CREATE || operation == OSB.Operation.UPDATE =>
+        Some(
+          LastOperationStatus(
+            OperationState.IN_PROGRESS,
+            Some(
+              s"Scheduler for service instance with id $serviceInstanceId is being re/started. Please re-try later for operation details.")))
+
+      case (operation, Some(_), Failure(_))
+        if operation == OSB.Operation.CREATE || operation == OSB.Operation.UPDATE =>
+        Some(
+          LastOperationStatus(
+            OperationState.IN_PROGRESS,
+            Some(
+              s"Scheduler for service instance with id $serviceInstanceId has started but monitoring is not yet available. Please re-try later for operation details.")
+          ))
+
+      case (operation,
+      Some(_),
+      Success(PlanApiClient.ApiModel.Plan(status, _, phases)))
+        if (operation == OSB.Operation.CREATE || operation == OSB.Operation.UPDATE) && inProgressStates
+          .contains(status) =>
+        Some(
+          LastOperationStatus(
+            OperationState.IN_PROGRESS,
+            Some(msgCreateUpdatePending(phases))
+          ))
+
+      case (operation,
+      Some(_),
+      Success(PlanApiClient.ApiModel.Plan("COMPLETE", _, phases)))
+        if operation == OSB.Operation.CREATE || operation == OSB.Operation.UPDATE =>
+        Some(
+          LastOperationStatus(
+            OperationState.SUCCEEDED,
+            Some(msgCreateUpdateComplete(phases))
+          ))
+
+      /* DESTROY
+      ----------- */
+
+      case (OSB.Operation.DESTROY, None, _) =>
+        Some(
+          LastOperationStatus(
+            OperationState.SUCCEEDED,
+            Some(
+              s"Service instance with id $serviceInstanceId not found (it may have never existed)")
+          ))
+
+      case (OSB.Operation.DESTROY, Some(_), Failure(_)) =>
+        Some(
+          LastOperationStatus(
+            OperationState.IN_PROGRESS,
+            Some(
+              s"Scheduler for service instance with id $serviceInstanceId has restarted but monitoring is not yet available. Please re-try later for operation details.")
+          ))
+
+      case (OSB.Operation.DESTROY,
+      Some(_),
+      Success(PlanApiClient.ApiModel.Plan(status, _, phases)))
+        if inProgressStates.contains(status) =>
+        Some(
+          LastOperationStatus(
+            OperationState.IN_PROGRESS,
+            Some(
+              msgDestroyPending(phases))
+          ))
+
+      case (OSB.Operation.DESTROY,
+      Some(_),
+      Success(PlanApiClient.ApiModel.Plan("COMPLETE", _, phases))) =>
+        Some(
+          LastOperationStatus(
+            OperationState.SUCCEEDED,
+            Some(s"Cluster with id $serviceInstanceId destroyed")
+          ))
+
+      case _ => None
+
+    }
+
+  }
+
   /* Internals,
   override, invoke at own risk
   ----------------------------- */
@@ -385,12 +533,14 @@ abstract class ServiceModule[
 
   private[this] var childMaker
     : Option[(ActorRefFactory, Class[_ <: Actor], String) => ActorRef] = None
+  private var aksm: Option[ActorRef] = None
 
   override def configure(configuration: ServiceModule.ActorConfiguration)
     : Future[ConfiguredActor.Configured] = {
     val promise = Promise[ConfiguredActor.Configured]()
 
     childMaker = Some(configuration.childMaker)
+    aksm = Some(configuration.aksm)
 
     if (stopDCOSProxy() == false)
       promise.completeWith(startDCOSProxy(configuration))
@@ -436,9 +586,11 @@ abstract class ServiceModule[
           smConfiguration: ServiceModuleConfiguration[_, _, _, _, _]) =>
         (dcosProxy ? DCOSProxy.Configuration(
           configuration.childMaker,
+          configuration.aksm,
           configuration.httpClientFactory,
           smConfiguration.dcosService.connection,
-          DCOSProxy.optimisticConnectionParametersVerifier))(
+          DCOSProxy.optimisticConnectionParametersVerifier,
+          smConfiguration.dcosService.pkg))(
           configurationTimeout) onComplete {
           case Success(Success(ConfiguredActor.Configured())) =>
             log.debug(s"Configured DCOSProxy($dcosProxy)")
@@ -497,56 +649,63 @@ abstract class ServiceModule[
                                parameters) =>
       val originalSender = sender()
       log.debug(s"Received CreateServiceInstance from $originalSender")
-      createServiceInstance(organizationGuid,
-                            plan,
-                            serviceId,
-                            spaceGuid,
-                            serviceInstanceId,
-                            parameters) onComplete {
 
-        case Success(packageOptions) =>
-          log.debug(
-            s"Received packageOptions $packageOptions from ServiceModule, forwarding to Cosmos")
-          configured((actorConfiguration => {
-            withServiceModuleConfiguration(
-              actorConfiguration.serviceId,
-              ((smc: ServiceModuleConfiguration[_, _, _, _, _]) => {
-                withDCOSProxy(
-                  ((p: ActorRef) => {
-                    (p ? DCOSProxy.Forward(
-                      DCOSProxy.Target.COSMOS,
-                      CosmosApiClient.InstallPackage[DCOSCommon.PackageOptions](
-                        smc.dcosService.pkg.pkgName,
-                        smc.dcosService.pkg.pkgVersion,
-                        packageOptions,
-                        smc.dcosService.pkgOptionsWriter
-                          .asInstanceOf[(DCOSCommon.PackageOptions => JsValue)]
-                      )
-                    )) onComplete {
+      withActorConfiguration((aC: ActorConfiguration) => {
 
-                      case Success(
-                          Success(
-                            packageInstallStarted: CosmosApiClient.PackageInstallStarted)) =>
-                        log.debug("Cosmos reports package install started")
-                        originalSender ! Success(packageOptions)
-                      case Success(Failure(e: Throwable)) =>
-                        originalSender ! Failure(e)
-                      case Failure(e: Throwable) =>
-                        originalSender ! Failure(e)
-                    }
+        createServiceInstance(organizationGuid,
+          plan,
+          serviceId,
+          spaceGuid,
+          s"/dcosb/$organizationGuid/$spaceGuid/${aC.serviceId}/$serviceInstanceId".toLowerCase,
+          parameters) onComplete {
 
-                  }),
-                  originalSender
-                )
-              }),
-              originalSender
-            )
-          }))
+          case Success(packageOptions) =>
+            log.debug(
+              s"Received packageOptions $packageOptions from ServiceModule, forwarding to Cosmos")
+            configured((actorConfiguration => {
+              withServiceModuleConfiguration(
+                actorConfiguration.serviceId,
+                ((smc: ServiceModuleConfiguration[_, _, _, _, _]) => {
+                  withDCOSProxy(
+                    ((p: ActorRef) => {
+                      (p ? DCOSProxy.Forward(
+                        DCOSProxy.Target.COSMOS,
+                        CosmosApiClient.InstallPackage[DCOSCommon.PackageOptions](
+                          smc.dcosService.pkg.pkgName,
+                          smc.dcosService.pkg.pkgVersion,
+                          packageOptions,
+                          smc.dcosService.pkgOptionsWriter
+                            .asInstanceOf[(DCOSCommon.PackageOptions => JsValue)]
+                        )
+                      )) onComplete {
 
-        case Failure(e: Throwable) =>
-          originalSender ! Failure(e)
+                        case Success(
+                        Success(
+                        packageInstallStarted: CosmosApiClient.PackageInstallStarted)) =>
+                          log.debug("Cosmos reports package install started")
+                          originalSender ! Success(packageOptions)
+                        case Success(Failure(e: Throwable)) =>
+                          originalSender ! Failure(e)
+                        case Failure(e: Throwable) =>
+                          originalSender ! Failure(e)
+                      }
 
-      }
+                    }),
+                    originalSender
+                  )
+                }),
+                originalSender
+              )
+            }))
+
+          case Failure(e: Throwable) =>
+            originalSender ! Failure(e)
+
+        }
+
+
+      }, originalSender)
+
 
     case UpdateServiceInstance(serviceId,
                                plan,
@@ -556,70 +715,74 @@ abstract class ServiceModule[
       val originalSender = sender()
       log.debug(s"Received UpdateServiceInstance from $originalSender")
 
-      discoverEndpoints(
-        serviceInstanceId,
-        (endpoints: List[Endpoint]) => {
-          getScheduler(serviceInstanceId, (scheduler: Option[DCOSCommon.Scheduler]) => {
+      withActualServiceInstanceId(serviceInstanceId, (actualServiceInstanceId: String) => {
 
-            updateServiceInstance(serviceId,
-              serviceInstanceId,
-              plan,
-              previousValues,
-              parameters,
-              endpoints,
-              scheduler) onComplete {
+        discoverEndpoints(
+          actualServiceInstanceId,
+          (endpoints: List[Endpoint]) => {
+            getScheduler(actualServiceInstanceId, (scheduler: Option[DCOSCommon.Scheduler]) => {
 
-              case Success(packageOptions) =>
-                log.debug(
-                  s"Received packageOptions $packageOptions from ServiceModule, forwarding to Cosmos")
+              updateServiceInstance(serviceId,
+                actualServiceInstanceId,
+                plan,
+                previousValues,
+                parameters,
+                endpoints,
+                scheduler) onComplete {
 
-                configured((actorConfiguration => {
-                  withServiceModuleConfiguration(
-                    actorConfiguration.serviceId,
-                    ((smc: ServiceModuleConfiguration[_, _, _, _, _]) => {
-                      withDCOSProxy(
-                        ((p: ActorRef) => {
-                          (p ? DCOSProxy.Forward(
-                            DCOSProxy.Target.COSMOS,
-                            CosmosApiClient
-                              .UpdatePackageOptions[DCOSCommon.PackageOptions](
-                              serviceInstanceId,
-                              packageOptions,
-                              smc.dcosService.pkgOptionsWriter
-                                .asInstanceOf[(
-                                DCOSCommon.PackageOptions => JsValue)]
-                            )
-                          )) onComplete {
+                case Success(packageOptions) =>
+                  log.debug(
+                    s"Received packageOptions $packageOptions from ServiceModule, forwarding to Cosmos")
 
-                            case Success(Success(
-                            packageUpdated: CosmosApiClient.PackageUpdated)) =>
-                              log.debug("Cosmos reports package update started")
-                              originalSender ! Success(packageOptions)
-                            case Success(Failure(e: Throwable)) =>
-                              originalSender ! Failure(e)
-                            case Failure(e: Throwable) =>
-                              originalSender ! Failure(e)
-                          }
+                  configured((actorConfiguration => {
+                    withServiceModuleConfiguration(
+                      actorConfiguration.serviceId,
+                      ((smc: ServiceModuleConfiguration[_, _, _, _, _]) => {
+                        withDCOSProxy(
+                          ((p: ActorRef) => {
+                            (p ? DCOSProxy.Forward(
+                              DCOSProxy.Target.COSMOS,
+                              CosmosApiClient
+                                .UpdatePackageOptions[DCOSCommon.PackageOptions](
+                                actualServiceInstanceId,
+                                packageOptions,
+                                smc.dcosService.pkgOptionsWriter
+                                  .asInstanceOf[(
+                                  DCOSCommon.PackageOptions => JsValue)]
+                              )
+                            )) onComplete {
 
-                        }),
-                        originalSender
-                      )
-                    }),
-                    originalSender
-                  )
-                }))
+                              case Success(Success(
+                              packageUpdated: CosmosApiClient.PackageUpdated)) =>
+                                log.debug("Cosmos reports package update started")
+                                originalSender ! Success(packageOptions)
+                              case Success(Failure(e: Throwable)) =>
+                                originalSender ! Failure(e)
+                              case Failure(e: Throwable) =>
+                                originalSender ! Failure(e)
+                            }
 
-              case Failure(e: Throwable) =>
-                originalSender ! Failure(e)
+                          }),
+                          originalSender
+                        )
+                      }),
+                      originalSender
+                    )
+                  }))
 
-            }
+                case Failure(e: Throwable) =>
+                  originalSender ! Failure(e)
 
-          }, originalSender)
+              }
+
+            }, originalSender)
 
 
-        },
-        originalSender
-      )
+          },
+          originalSender
+        )
+      }, originalSender)
+
 
     case BindApplicationToServiceInstance(serviceId,
                                           plan,
@@ -629,27 +792,31 @@ abstract class ServiceModule[
                                           parameters) =>
       val originalSender = sender()
 
-      discoverEndpoints(
-        serviceInstanceId,
-        (endpoints: List[Endpoint]) => {
-          getScheduler(serviceInstanceId, (scheduler: Option[DCOSCommon.Scheduler]) => {
+      withActualServiceInstanceId(serviceInstanceId, (actualServiceInstanceId: String) => {
 
-            broadcastFuture(bindApplicationToServiceInstance(serviceId,
-              plan,
-              bindResource,
-              bindingId,
-              serviceId,
-              parameters,
-              endpoints,
-              scheduler),
-              originalSender)
+        discoverEndpoints(
+          actualServiceInstanceId,
+          (endpoints: List[Endpoint]) => {
+            getScheduler(actualServiceInstanceId, (scheduler: Option[DCOSCommon.Scheduler]) => {
 
-          }, originalSender)
+              broadcastFuture(bindApplicationToServiceInstance(serviceId,
+                plan,
+                bindResource,
+                bindingId,
+                actualServiceInstanceId,
+                parameters,
+                endpoints,
+                scheduler),
+                originalSender)
+
+            }, originalSender)
 
 
-        },
-        originalSender
-      )
+          },
+          originalSender
+        )
+      }, originalSender)
+
 
     case UnbindApplicationFromServiceInstance(serviceId,
                                               plan,
@@ -657,118 +824,166 @@ abstract class ServiceModule[
                                               serviceInstanceId) =>
       val originalSender = sender()
 
-      discoverEndpoints(
-        serviceInstanceId,
-        (endpoints: List[Endpoint]) => {
+      withActualServiceInstanceId(serviceInstanceId, (actualServiceInstanceId: String) => {
 
-          getScheduler(serviceInstanceId, (scheduler: Option[DCOSCommon.Scheduler]) => {
+        discoverEndpoints(
+          actualServiceInstanceId,
+          (endpoints: List[Endpoint]) => {
 
-            broadcastFuture(
-              unbindApplicationFromServiceInstance(serviceId,
-                plan,
-                bindingId,
-                serviceInstanceId,
-                endpoints,
-                scheduler),
-              originalSender)
+            getScheduler(actualServiceInstanceId, (scheduler: Option[DCOSCommon.Scheduler]) => {
 
-          }, originalSender)
+              broadcastFuture(
+                unbindApplicationFromServiceInstance(serviceId,
+                  plan,
+                  bindingId,
+                  actualServiceInstanceId,
+                  endpoints,
+                  scheduler),
+                originalSender)
 
-        },
-        originalSender
-      )
+            }, originalSender)
+
+          },
+          originalSender
+        )
+      }, originalSender)
+
 
     case LastOperation(serviceId, plan, serviceInstanceId, operation) =>
       val originalSender = sender()
 
-      discoverEndpoints(
-        serviceInstanceId,
-        (endpoints: List[Endpoint]) => {
-          retrievePlan(
-            serviceInstanceId,
-            "deploy",
-            (updatePlan: Try[PlanApiClient.ApiModel.Plan]) => {
-              getScheduler(serviceInstanceId, (scheduler: Option[DCOSCommon.Scheduler]) => {
+      withActualServiceInstanceId(serviceInstanceId, (actualServiceInstanceId: String) => {
 
-                lastOperation(serviceId,
-                  plan,
-                  serviceInstanceId,
-                  operation,
-                  endpoints,
-                  scheduler,
-                  updatePlan) onComplete {
-                  case Success(lastOperationStatus: LastOperationStatus) =>
-                    originalSender ! Success(lastOperationStatus)
-                  case Failure(e: Throwable) =>
-                    originalSender ! Failure(e)
-                }
+        discoverEndpoints(
+          actualServiceInstanceId,
+          (endpoints: List[Endpoint]) => {
+            retrievePlan(
+              actualServiceInstanceId,
+              "deploy",
+              (updatePlan: Try[PlanApiClient.ApiModel.Plan]) => {
+                getScheduler(actualServiceInstanceId, (scheduler: Option[DCOSCommon.Scheduler]) => {
 
-              }, originalSender)
+                  lastOperation(serviceId,
+                    plan,
+                    actualServiceInstanceId,
+                    operation,
+                    endpoints,
+                    scheduler,
+                    updatePlan) onComplete {
+                    case Success(lastOperationStatus: LastOperationStatus) =>
+                      originalSender ! Success(lastOperationStatus)
+                    case Failure(e: Throwable) =>
+                      originalSender ! Failure(e)
+                  }
 
-            }
-          )
-        },
-        originalSender
-      )
+                }, originalSender)
+
+              }
+            )
+          },
+          originalSender
+        )
+      }, originalSender)
+
 
     case DestroyServiceInstance(serviceId, plan, serviceInstanceId) =>
       val originalSender = sender()
 
-      def invokeDestroyService(dcosProxy: ActorRef,
-                               smc: ServiceModuleConfiguration[_, _, _, _, _],
-                               endpoints: List[Endpoint], scheduler: Option[DCOSCommon.Scheduler]): Unit = {
+      withActualServiceInstanceId(serviceInstanceId, (actualServiceInstanceId: String) => {
 
-        destroyServiceInstance(serviceId, plan, serviceInstanceId, endpoints, scheduler) onComplete {
-          case Success(serviceInstanceDestroyed: ServiceInstanceDestroyed) =>
-            (dcosProxy ? DCOSProxy.Forward(
-              DCOSProxy.Target.COSMOS,
-              CosmosApiClient.UninstallPackage(smc.dcosService.pkg.pkgName,
-                                               serviceInstanceId))) onComplete {
+        def invokeDestroyService(dcosProxy: ActorRef,
+                                 smc: ServiceModuleConfiguration[_, _, _, _, _],
+                                 endpoints: List[Endpoint], scheduler: Option[DCOSCommon.Scheduler]): Unit = {
 
-              case Success(
-                  Success(
-                    packageUninstalled: CosmosApiClient.PackageUninstalled)) =>
-                log.debug("Cosmos reports package uninstall started")
-                originalSender ! Success(
-                  ServiceModule.ServiceInstanceDestroyed(serviceInstanceId))
-              case Success(Failure(e: Throwable)) =>
-                originalSender ! Failure(e)
-              case Failure(e: Throwable) =>
-                originalSender ! Failure(e)
+          destroyServiceInstance(serviceId, plan, actualServiceInstanceId, endpoints, scheduler) onComplete {
+            case Success(serviceInstanceDestroyed: ServiceInstanceDestroyed) =>
+              (dcosProxy ? DCOSProxy.Forward(
+                DCOSProxy.Target.COSMOS,
+                CosmosApiClient.UninstallPackage(smc.dcosService.pkg.pkgName,
+                  actualServiceInstanceId))) onComplete {
 
-            }
+                case Success(
+                Success(
+                packageUninstalled: CosmosApiClient.PackageUninstalled)) =>
+                  log.debug("Cosmos reports package uninstall started")
+                  originalSender ! Success(
+                    ServiceModule.ServiceInstanceDestroyed(actualServiceInstanceId))
+                case Success(Failure(e: Throwable)) =>
+                  originalSender ! Failure(e)
+                case Failure(e: Throwable) =>
+                  originalSender ! Failure(e)
 
-          case Failure(e: Throwable) =>
-            originalSender ! Failure(e)
+              }
 
+            case Failure(e: Throwable) =>
+              originalSender ! Failure(e)
+
+          }
         }
-      }
 
-      configured((actorConfiguration => {
-        withServiceModuleConfiguration(
-          actorConfiguration.serviceId,
-          ((smc: ServiceModuleConfiguration[_, _, _, _, _]) => {
-            withDCOSProxy(
-              ((p: ActorRef) => {
-                discoverEndpoints(serviceInstanceId,
-                                  (endpoints: List[Endpoint]) => {
-                                    getScheduler(serviceInstanceId, (scheduler: Option[DCOSCommon.Scheduler]) => {
-                                      invokeDestroyService(p, smc, endpoints, scheduler)
-                                    }, originalSender)
-                                  },
-                                  originalSender)
+        configured((actorConfiguration => {
+          withServiceModuleConfiguration(
+            actorConfiguration.serviceId,
+            ((smc: ServiceModuleConfiguration[_, _, _, _, _]) => {
+              withDCOSProxy(
+                ((p: ActorRef) => {
+                  discoverEndpoints(actualServiceInstanceId,
+                    (endpoints: List[Endpoint]) => {
+                      getScheduler(actualServiceInstanceId, (scheduler: Option[DCOSCommon.Scheduler]) => {
+                        invokeDestroyService(p, smc, endpoints, scheduler)
+                      }, originalSender)
+                    },
+                    originalSender)
 
-              }),
-              originalSender
-            )
-          }),
-          originalSender
-        )
-      }))
+                }),
+                originalSender
+              )
+            }),
+            originalSender
+          )
+        }))
+      }, originalSender)
+
 
     case GetServiceModuleConfiguration(serviceId: String) =>
       sender() ! getConfiguration(serviceId)
 
+  }
+
+  /**
+    * Takes the service instance id as sent by the platform and
+    * resolves the complete id ( of the scheduler - with application groups ) as present in Marathon
+    * @param platformServiceInstanceId
+    * @param f
+    * @param replyTo
+    * @return
+    */
+  private def withActualServiceInstanceId(platformServiceInstanceId: String, f:(String) => _, replyTo: ActorRef) = {
+    withDCOSProxy((p: ActorRef) => {
+      log.debug(s"Getting AppIds matching $platformServiceInstanceId via MarathonApiClient")
+      (p ? DCOSProxy.Forward(
+        DCOSProxy.Target.MARATHON,
+        MarathonApiClient.GetAppIds(platformServiceInstanceId)
+      )) onComplete {
+        case Success(Success(ids: Seq[String])) if ids.size == 0 =>
+          // scheduler not running :S
+          replyTo ! Failure(ServiceModule.ServiceInstanceNotFound(platformServiceInstanceId))
+        case Success(Success(ids: Seq[String])) if ids.size > 1 =>
+          // ambigous cfServiceInstanceId ( resolved to multiple schedulers )
+          replyTo ! Failure(ServiceModule.MalformedRequest(s"Ambigous service instance identifier $platformServiceInstanceId. Contact support."))
+        case Success(Success(ids: Seq[String])) =>
+          f(ids.head)
+        case Success(Failure(e: Throwable)) =>
+          log.error(
+            s"MarathonApiClient failed to retrieve app ids for id substring $platformServiceInstanceId, failure was: $e")
+          replyTo ! Failure(e)
+        case Failure(e: Throwable) =>
+          log.error(
+            s"Exception while trying to retrieve app ids for id substring $platformServiceInstanceId: $e")
+          replyTo ! Failure(e)
+      }
+
+    }, replyTo)
   }
 
   private def endpointsFromFrameworks(frameworks: Seq[Framework],
@@ -785,8 +1000,8 @@ abstract class ServiceModule[
                       yield
                         // TODO make TLD configurable..
                       Port(port.name,
-                        InetSocketAddress.createUnresolved(
-                          s"${discovery.name}.$fwName.mesos",
+                        new InetSocketAddress(
+                          s"${discovery.name}.${fwName.replaceAll("/","")}.mesos",
                           port.number))
                   ))
             }
@@ -804,23 +1019,44 @@ abstract class ServiceModule[
       (p: ActorRef) => {
         // TODO this is a bit heavy
         log.debug("Getting Endpoints via MesosApiClient")
+        log.debug(s"Getting StateSummary to resolve framework name ${serviceInstanceId} to a framework id")
         (p ? DCOSProxy.Forward(
           DCOSProxy.Target.MESOS,
-          MesosApiClient.Master.GetFrameworks())) onComplete {
-          case Success(
-              Success(frameworks: Seq[
-                MesosApiClient.MesosApiModel.Master.Frameworks.Framework])) =>
-            log.debug("Retrieved Frameworks..")
-            f(endpointsFromFrameworks(frameworks, serviceInstanceId))
+          MesosApiClient.Master.GetStateSummary())) onComplete {
+          case Success(Success(summary: MesosApiClient.Master.StateSummary)) =>
+            log.debug("Retrieved StateSummary..")
+            summary.frameworks.find( _.name == serviceInstanceId) match {
+              case Some(frameworkSummary) =>
+                log.debug(s"Resolved framework name $serviceInstanceId to framework id ${frameworkSummary.id}")
+                log.debug(s"Getting framework with id ${frameworkSummary.id}")
+                (p ? DCOSProxy.Forward(
+                  DCOSProxy.Target.MESOS,
+                  MesosApiClient.Master.GetFramework(frameworkSummary.id))) onComplete {
+                  case Success(Success(
+                  framework: MesosApiClient.MesosApiModel.Master.Frameworks.Framework)) =>
+                    log.debug("Retrieved Framework")
+                    f(endpointsFromFrameworks(List(framework), serviceInstanceId))
+                  case Success(Failure(e: Throwable)) =>
+                    log.error(
+                      s"MesosApiClient failed to retrieve framework, failure was: $e")
+                    replyTo ! Failure(e)
+                  case Failure(e: Throwable) =>
+                    log.error(
+                      s"MesosApiClient failed to retrieve framework, failure was: $e")
+                    replyTo ! Failure(e)
 
+                }
+              case None =>
+                log.debug(s"No framework with name ${serviceInstanceId} was found in summary")
+                f(List.empty)
+            }
           case Success(Failure(e: Throwable)) =>
             log.error(
-              s"MesosApiClient failed to retrieve frameworks, failure was: $e")
+              s"MesosApiClient failed to retrieve state summary, failure was: $e")
             replyTo ! Failure(e)
-
           case Failure(e: Throwable) =>
             log.error(
-              s"Failed to get frameworks from MesosApiClient, failure was: $e")
+              s"MesosApiClient failed to retrieve state summary, failure was: $e")
             replyTo ! Failure(e)
 
         }
@@ -871,6 +1107,14 @@ abstract class ServiceModule[
             "No DC/OS Proxy was available to serve this request",
             None,
             None))
+    }
+  }
+
+  private def withActorConfiguration(f: (ServiceModule.ActorConfiguration) => _, replyTo: ActorRef) = {
+    try {
+      configured((actorConfiguration: ServiceModule.ActorConfiguration) => { f(actorConfiguration) })
+    } catch {
+      case e: Throwable => replyTo ! Failure(e)
     }
   }
 

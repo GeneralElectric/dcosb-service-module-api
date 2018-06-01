@@ -222,13 +222,15 @@ trait BasicServiceModule
                 if (config.hasPath("dcos.connection.principal"))
                   Some(config.getString("dcos.connection.principal"))
                 else None,
-              privateKey = if (config.hasPath("dcos.connection.private-key")) {
-                FileUtils
-                  .file(config.getString("dcos.connection.private-key")) match {
-                  case Success(f: Array[Byte]) => Some(f)
-                  case Failure(e: Throwable)   => throw e
-                }
-              } else None
+              privateKeyAlias = if (config.hasPath("dcos.connection.private-key-alias"))
+                Some(config.getString("dcos.connection.private-key-alias"))
+              else None,
+              privateKeyStoreId = if (config.hasPath("dcos.connection.private-key-store-id"))
+                Some(config.getString("dcos.connection.private-key-store-id"))
+              else None,
+              privateKeyPassword = if (config.hasPath("dcos.connection.private-key-password"))
+                Some(config.getString("dcos.connection.private-key-password"))
+              else None
             )
           ),
           openService = OpenServiceBrokerApi

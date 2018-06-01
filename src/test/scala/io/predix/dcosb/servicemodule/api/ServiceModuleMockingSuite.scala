@@ -118,7 +118,7 @@ trait ServiceModuleMockingSuite extends DCOSBSuite with ActorSystemProvider {
         implicit val ec = getActorSystem().dispatcher
         override def receive: Receive = {
 
-          case ServiceModule.ActorConfiguration(_, _, _) =>
+          case ServiceModule.ActorConfiguration(_, _, _, _) =>
             sender() ! ConfiguredActor.Configured()
           case ServiceModule.GetServiceModuleConfiguration(serviceId) =>
             val configurationReader = new BasicServiceModule {}
